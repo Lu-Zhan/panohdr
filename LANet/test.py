@@ -120,6 +120,28 @@ def read_img(ldr_name,height, width, strategy='smooth'):
     return ldr_img_gt.unsqueeze(dim=0).cuda(), mask_gt.unsqueeze(dim=0).cuda()
 
 
+def read_exr_image(ldr_name, height, width, strategy='smooth'):
+    hdr_img = read_exr(os.path.join(args.test_dir, ldr_name))
+    hdr_img = hdr_img[..., ::-1]   # RGB to BGR
+    hdr_img = resize(hdr_img, (height, width), anti_aliasing=True)
+    ldr_img = hdr_to_ldr(hdr_img, dtype='uint8')
+
+    if strategy == 'basic':
+        mask = create_mask(ldr_img, height, width)
+    elif strategy == 'binary':
+        mask = binary_mask(ldr_img, height, width)
+    elif strategy == 'smooth':
+        mask = smooth_mask(ldr_img, height, width)
+    mask_gt = torch.from_numpy(mask)
+    mask_gt = mask_gt.permute(2, 0, 1)
+
+    ldr_img_gt = torch.from_numpy(np.clip(ldr_img, 1e-5, 1))
+    ldr_img_gt = ldr_img_gt.permute(2, 0, 1)
+    ldr_img_gt = ldr_img_gt.float()
+
+    return ldr_img_gt.unsqueeze(dim=0).cuda(), mask_gt.unsqueeze(dim=0).cuda(), hdr_img # (128, 256, 3)
+
+
 def make_image(image, gamma_correct=True, exposure=1):
     output = np.clip(np.clip(image, 0, 1)*exposure, 0, 1)
     if gamma_correct:
@@ -139,14 +161,91 @@ def siMSE(gt, pred, alpha=1.0):
     return torch.mean(torch.mean((gt-pred)**2, axis=[1, 2, 3])
                       - alpha*torch.pow(torch.mean(gt-pred, axis=[1, 2, 3]), 2))
 
+
+import Imath
+import numpy as np
+from PIL import Image
+from OpenEXR import InputFile, OutputFile, Header
+
+def read_exr(filename, channel=3):
+	"""Reads an OpenEXR file and returns the data as a numpy array.
+	Args:
+	    filename: path to exr file
+		channel: number of channels in exr file
+	Return
+		rgb32f: numpy array of shape [height, width, channel]
+	"""
+	src = InputFile(filename)
+	pixel_type = Imath.PixelType(Imath.PixelType.FLOAT)
+	dw = src.header()['dataWindow']
+	size = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
+
+	rgb32f = None
+	if channel == 3:
+		for i, c in enumerate('RGB'):
+			c32f = np.fromstring(src.channel(c, pixel_type), dtype=np.float32).reshape(size[::-1])
+			rgb32f = c32f if i == 0 else np.dstack((rgb32f, c32f))
+	elif channel == 1:
+		rgb32f = np.fromstring(src.channel('A', pixel_type), dtype=np.float32).reshape(size[::-1]).unsqueeze(2)
+
+	return rgb32f
+
+
+def write_exr(filename, data):
+	"""Write an OpenEXR file from a numpy array.
+	Args:
+		filename: path to exr file
+		data: numpy array to write to exr file
+	"""
+	assert '.exr' in filename, 'extension must be .exr'
+	assert data.dtype == np.float32, f'Data type is {type(data)}, should be np.float32'
+
+	out = OutputFile(filename, Header(data.shape[1], data.shape[0]))
+
+	if data.shape[2] == 3:
+		r, g, b = data[:, :, 0], data[:, :, 1], data[:, :, 2]
+	elif data.shape[2] == 1:
+		r = g = b = data[:, :, 0]
+	out.writePixels({'R': r.tostring(), 'G': g.tostring(), 'B': b.tostring()})
+
+	out.close()
+
+
+def hdr_to_ldr(color, gamma=2.2, dtype='float32', clamp=True):
+	# aces tone mapping
+	A = 2.51
+	B = 0.03
+	C = 2.43
+	D = 0.59
+	E = 0.14
+
+	# color: [B, 3]
+	color = (color * (A * color + B)) / (color * (C * color + D) + E)
+	if type(color) is torch.Tensor:
+		if clamp:
+			color = torch.clamp(color, 0, 1)
+		if dtype == 'uint8':
+			color = (color * 255.).to(torch.uint8) / 255.
+			color = color.to(torch.float32)
+	elif type(color) is np.ndarray:
+		if clamp:
+			color = np.clip(color, 0, 1)
+		if dtype == 'uint8':
+			color = (color * 255).astype(np.uint8) / 255.
+			color = color.astype(np.float32)
+	else:
+		raise TypeError('color must be torch.Tensor or np.ndarray')
+
+	return color ** (1 / gamma)
+
+
 if __name__ == '__main__':
-    
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_dir', type=str, default='')
     parser.add_argument('--gt_dir', type=str, default='')
-    parser.add_argument('--ckpt', type=str, default='')
-    parser.add_argument('--width', type=int, default=1024)
-    parser.add_argument('--height', type=int, default=512)
+    parser.add_argument('--ckpt', type=str, default='checkpoints')
+    parser.add_argument('--width', type=int, default=256)
+    parser.add_argument('--height', type=int, default=128)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--output_dir', type=str, default='./')
     parser.add_argument('--strategy', type=str, default='smooth')
@@ -154,8 +253,7 @@ if __name__ == '__main__':
                         default='transportMat.BumpySphereMiddle.top.e64.r64.half.mat', help='directory to data')
     args = parser.parse_args()
 
-    device = 'cuda'
-
+    device = 'cuda:0'
 
     if args.gt_dir != '':
         imgs = [f for f in os.listdir(args.gt_dir) if os.path.isfile(
@@ -166,7 +264,8 @@ if __name__ == '__main__':
         imgs = [f for f in os.listdir(args.test_dir) if os.path.isfile(
             os.path.join(args.test_dir, f))]
 
-    os.makedirs(f'{args.output_dir}/', exist_ok=True)
+    os.makedirs(f'{args.output_dir}/gt', exist_ok=True)
+    os.makedirs(f'{args.output_dir}/pred', exist_ok=True)
 
     l2loss = nn.MSELoss()
     l1loss = nn.L1Loss()
@@ -199,7 +298,7 @@ if __name__ == '__main__':
             cv2.imwrite(os.path.join(f'{args.output_dir}/mask_gt/',
                     name+'.hdr'), output_mask_gt)
         else:
-            ldr_gt, mask_gt = read_img(
+            ldr_gt, mask_gt, hdr_gt = read_exr_image(
                 f'{i}', args.height, args.width, args.strategy) 
         
         '''
@@ -208,8 +307,7 @@ if __name__ == '__main__':
         hdr_pred, mask_pred = model(ldr_gt)
         epsilon = torch.tensor([1e-5]).cuda()
         output_hdr_pred = tensor2np(hdr_pred)
-        output_hdr_pred = np.transpose(
-            np.exp(output_hdr_pred), (1, 2, 0)).astype('float32')
+        output_hdr_pred = np.transpose(np.exp(output_hdr_pred), (1, 2, 0)).astype('float32')
 
         hdr_mask = torch.exp(hdr_pred+epsilon)*mask_gt
         ldr_gamma_gt = ldr_gt**(2.2)
@@ -217,17 +315,18 @@ if __name__ == '__main__':
         hdr_mask_pred = ldr_mask+hdr_mask
 
         output_mask_pred = tensor2np(hdr_mask_pred)
-        output_mask_pred = np.transpose(
-            output_mask_pred, (1, 2, 0)).astype('float32')
-        output_mask_pred = resize(output_mask_pred, (480, 960), anti_aliasing=True)
+        output_mask_pred = np.transpose(output_mask_pred, (1, 2, 0)).astype('float32')
+        output_mask_pred = resize(output_mask_pred, (128, 256), anti_aliasing=True)
         
 
-        ldr_gamma_gt = tensor2np(ldr_gamma_gt)
-        ldr_gamma_gt = np.transpose(
-            ldr_gamma_gt, (1, 2, 0)).astype('float32')
-        
-        cv2.imwrite(os.path.join(f'{args.output_dir}/',
-                    name+'.hdr'), output_mask_pred)
+        # ldr_gamma_gt = tensor2np(ldr_gamma_gt)
+        # ldr_gamma_gt = np.transpose(ldr_gamma_gt, (1, 2, 0)).astype('float32')
+
+        # save pred and gt
+        output_mask_pred = output_mask_pred[..., ::-1]
+        hdr_gt = hdr_gt[..., ::-1]  # BGR to RGB
+        write_exr(output_mask_pred, f'{args.output_dir}/pred/{name}.exr')
+        write_exr(hdr_gt, f'{args.output_dir}/gt/{name}.exr')
     
 
     
